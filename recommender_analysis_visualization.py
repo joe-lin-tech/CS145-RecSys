@@ -48,6 +48,11 @@ from sample_recommenders import (
 )
 from config import DEFAULT_CONFIG, EVALUATION_METRICS
 
+from sklearn.preprocessing import StandardScaler
+from xgboost import XGBClassifier
+
+from sim4rec.utils import pandas_to_spark
+
 # Cell: Define custom recommender template
 """
 ## MyRecommender Template
@@ -73,6 +78,25 @@ class MyRecommender:
         """
         self.seed = seed
         # Add your initialization logic here
+        
+        # for content-based recommender
+        self.model = XGBClassifier(
+            objective="binary:logistic",
+            eval_metric="logloss",
+            learning_rate=0.1,
+            max_depth=10,
+            n_estimators=1000,
+            reg_alpha=0.1,
+            reg_lambda=5,
+            use_label_encoder=False,
+            seed=self.seed
+        )
+        
+        # for sequential-based recommender
+        self.max_seq_len = 50
+        self.user_history = defaultdict(list)
+
+        self.scalar = StandardScaler()
     
     def fit(self, log, user_features=None, item_features=None):
         """
@@ -89,8 +113,20 @@ class MyRecommender:
         #  2. Learn user preferences from the log
         #  3. Build item similarity matrices or latent factor models
         #  4. Store learned parameters for later prediction
-        pass
-    
+
+        # for content-based recommender
+        if user_features and item_features:
+            pd_log = log.join(user_features, on="user_idx").join(
+                item_features, on="item_idx").drop("user_idx", "item_idx", "__iter").toPandas()
+
+            pd_log = pd.get_dummies(pd_log)
+            pd_log['price'] = self.scalar.fit_transform(pd_log[['price']])
+
+            y = pd_log['relevance']
+            x = pd_log.drop(['relevance'], axis=1)
+
+            self.model.fit(x, y)
+
     def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
         """
         Generate recommendations for users.
@@ -113,34 +149,30 @@ class MyRecommender:
         #  2. Calculate relevance scores for each user-item pair
         #  3. Rank items by relevance and select top-k
         #  4. Return a dataframe with columns: user_idx, item_idx, relevance
-        
-        # Example of a random recommender implementation:
-        # Cross join users and items
-        recs = users.crossJoin(items)
-        
-        # Filter out already seen items if needed
-        if filter_seen_items and log is not None:
-            seen_items = log.select("user_idx", "item_idx")
-            recs = recs.join(
-                seen_items,
-                on=["user_idx", "item_idx"],
-                how="left_anti"
-            )
-        
-        # Add random relevance scores
-        recs = recs.withColumn(
-            "relevance",
-            sf.rand(seed=self.seed)
-        )
-        
-        # Rank items by relevance for each user
-        window = Window.partitionBy("user_idx").orderBy(sf.desc("relevance"))
-        recs = recs.withColumn("rank", sf.row_number().over(window))
-        
-        # Filter top-k recommendations
-        recs = recs.filter(sf.col("rank") <= k).drop("rank")
-        
-        return recs
+        cross = users.crossJoin(items).drop("__iter").toPandas().copy()
+
+        cross = pd.get_dummies(cross)
+        cross['orig_price'] = cross['price']
+        cross['price'] = self.scalar.transform(cross[['price']])
+
+        cross['prob'] = self.model.predict_proba(cross.drop(['user_idx', 'item_idx', 'orig_price'], axis=1))[:, np.where(self.model.classes_ == 1)[0][0]]
+        # ranking strategy #1
+        cross['relevance'] = cross['prob']
+        # 13757.794205 11989.233503 2751.558841 2397.846701 0.102164 0.093003 0.623513 0.632488 0.208757 0.195399 1637.235156 1406.178382
+
+        # ranking strategy #2
+        cross['expected_revenue'] = cross['prob'] * cross['price']
+        # 27824.587397 25614.228831 5564.917479 5122.845766 0.102164 0.093003 0.636853 0.627764 0.214730 0.192170 3289.998032 3038.555065
+
+        # ranking strategy #3
+        # TODO
+
+        cross = cross.sort_values(by=["user_idx", "expected_revenue"], ascending=[True, False])
+        cross = cross.groupby("user_idx").head(k)
+
+        cross['price'] = cross['orig_price']
+
+        return pandas_to_spark(cross)
 
 # Cell: Data Exploration Functions
 """
