@@ -53,6 +53,69 @@ from xgboost import XGBClassifier
 
 from sim4rec.utils import pandas_to_spark
 
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+
+# for sequential-based recommender
+class SequentialModel(nn.Module):
+    def __init__(self, n_items, embedding_dim=32, hidden_dim=32):
+        super(SequentialModel, self).__init__()
+        self.n_items = n_items
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim
+
+        # embedding layer not needed if using input features
+        # self.embedding = nn.Embedding(n_items + 1, embedding_dim, padding_idx=0)
+
+        # for rnn, gru, lstm
+        # self.rnn = nn.RNN(embedding_dim, hidden_dim, batch_first=True)
+        # self.gru = nn.GRU(embedding_dim, hidden_dim, batch_first=True, dropout=0.5)  
+        # self.lstm = nn.LSTM(embedding_dim, hidden_dim, batch_first=True)
+
+        # for transformer
+        self.linear = nn.Linear(embedding_dim, hidden_dim)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=8,
+            dim_feedforward=hidden_dim * 4,
+            dropout=0.6,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
+
+        self.out = nn.Linear(hidden_dim, n_items)
+
+    def forward(self, x): # x: (B, T)
+        # embedding layer not needed if using input features
+        # embedding = self.embedding(x) # embedding: (B, T, E)
+        embedding = x
+
+        # for rnn, gru, lstm
+        # _, hidden = self.rnn(embedding) # hidden: (1, B, H)
+        # _, hidden = self.gru(embedding) # hidden: (1, B, H)
+        # _, (hidden, _) = self.lstm(embedding) # hidden: (1, B, H)
+        # hidden = hidden.squeeze(0)
+
+        # for transformer
+        embedding = self.linear(embedding)
+        hidden = self.transformer(embedding)[:, -1, :]
+        return self.out(hidden) # out: (B, C)
+
+class SequentialDataset(Dataset):
+    def __init__(self, sequences, targets):
+        self.sequences = torch.tensor(sequences).float()
+        self.targets = torch.tensor(targets).long()
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, idx):
+        return self.sequences[idx], self.targets[idx]
+
 # Cell: Define custom recommender template
 """
 ## MyRecommender Template
@@ -80,23 +143,86 @@ class MyRecommender:
         # Add your initialization logic here
         
         # for content-based recommender
-        self.model = XGBClassifier(
-            objective="binary:logistic",
-            eval_metric="logloss",
-            learning_rate=0.1,
-            max_depth=10,
-            n_estimators=1000,
-            reg_alpha=0.1,
-            reg_lambda=5,
-            use_label_encoder=False,
-            seed=self.seed
-        )
+        # self.model = XGBClassifier(
+        #     objective="binary:logistic",
+        #     eval_metric="logloss",
+        #     learning_rate=0.1,
+        #     max_depth=10,
+        #     n_estimators=1000,
+        #     reg_alpha=0.1,
+        #     reg_lambda=5,
+        #     use_label_encoder=False,
+        #     seed=self.seed
+        # )
         
         # for sequential-based recommender
-        self.max_seq_len = 50
+        torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
+        self.max_seq_len = 20
         self.user_history = defaultdict(list)
+        self.lr = 1e-3
+        self.epochs = 50
+        self.batch_size = 64
+        self.device = torch.device("mps" if torch.mps.is_available() else "cpu")
 
         self.scalar = StandardScaler()
+
+    def pad_sequences(self, sequences):
+        """
+        Pads sequences to max_seq_len for the sequence-based recommender.
+        
+        Args:
+            sequences: List of data sequences to pad
+        """
+        padded = np.zeros((len(sequences), self.max_seq_len), dtype=np.int64)
+        for i, seq in enumerate(sequences):
+            if len(seq) > self.max_seq_len:
+                padded[i, :] = seq[-self.max_seq_len:]
+            else:
+                padded[i, self.max_seq_len - len(seq):] = seq
+        return padded
+    
+    def seq_train(self, train_loader, val_loader):
+        """
+        Trains a PyTorch sequential model and evaluates every epoch.
+
+        Args:
+            train_loader: PyTorch DataLoader containing training data
+            val_loader: PyTorch DataLoader containing validation data
+        """
+        self.model.train()
+        for epoch in range(self.epochs):
+            train_loss = 0
+            for input, label in train_loader:
+                input = input.to(self.device)
+                label = label.to(self.device)
+
+                self.optimizer.zero_grad()
+                pred = self.model(input)
+                loss = self.criterion(pred, label)
+                loss.backward()
+                self.optimizer.step()
+                train_loss += loss.item()
+            
+            train_loss /= len(train_loader)
+
+            self.model.eval()
+            val_loss = 0
+            correct_predictions = 0
+            with torch.no_grad():
+                for seq_batch, target_batch in val_loader:
+                    seq_batch, target_batch = seq_batch.to(self.device), target_batch.to(self.device)
+                    outputs = self.model(seq_batch)
+                    loss = self.criterion(outputs, target_batch)
+                    val_loss += loss.item()
+                    
+                    _, predicted = torch.max(outputs.data, 1)
+                    correct_predictions += (predicted == target_batch).sum().item()
+            
+            val_loss /= len(val_loader)
+            # val_accuracy = correct_predictions / len(val_dataset)
+
+            print(f"Epoch {epoch+1}/{self.epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}") # , Val Acc: {val_accuracy:.4f}")
     
     def fit(self, log, user_features=None, item_features=None):
         """
@@ -115,17 +241,68 @@ class MyRecommender:
         #  4. Store learned parameters for later prediction
 
         # for content-based recommender
+        # if user_features and item_features:
+        #     pd_log = log.join(user_features, on="user_idx").join(
+        #         item_features, on="item_idx").drop("user_idx", "item_idx", "__iter").toPandas()
+
+        #     pd_log = pd.get_dummies(pd_log)
+        #     pd_log['price'] = self.scalar.fit_transform(pd_log[['price']])
+
+        #     y = pd_log['relevance']
+        #     x = pd_log.drop(['relevance'], axis=1)
+
+        #     self.model.fit(x, y)
+        
+        # for sequential-based recommender
         if user_features and item_features:
-            pd_log = log.join(user_features, on="user_idx").join(
-                item_features, on="item_idx").drop("user_idx", "item_idx", "__iter").toPandas()
+            self.item_features = item_features.toPandas()
+            self.item_features = pd.get_dummies(self.item_features)
+            log = log.toPandas()
 
-            pd_log = pd.get_dummies(pd_log)
-            pd_log['price'] = self.scalar.fit_transform(pd_log[['price']])
+            item_ids = self.item_features['item_idx'].unique()
+            self.n_items = len(item_ids)
 
-            y = pd_log['relevance']
-            x = pd_log.drop(['relevance'], axis=1)
+            # if not hasattr(self, "model"):
+            self.model = SequentialModel(self.n_items, embedding_dim=len(self.item_features.columns)).to(self.device)
+            self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
+            self.criterion = nn.CrossEntropyLoss()
+            
+            if "timestamp" not in log.columns:
+                log['timestamp'] = log.index
+            log.sort_values(by=["user_idx", "timestamp"], inplace=True)
 
-            self.model.fit(x, y)
+            inputs = []
+            labels = []
+            for user_id, transactions in log.groupby("user_idx"):
+                curr_user_history = transactions[['timestamp', 'item_idx', 'relevance']].to_dict('records')
+                self.user_history[user_id].extend(curr_user_history)
+                self.user_history[user_id] = sorted(self.user_history[user_id], key=lambda x: x['timestamp'])
+
+                items = transactions['item_idx'].tolist()
+                
+                for i in range(1, len(items)):
+                    seq = items[:i]
+                    target_item = items[i]
+                    # padded_seq = self.pad_sequences([seq])[0]
+                    # TODO - fix pad
+                    padded_seq = self.pad_sequences([[s + 1 for s in seq]])[0]
+                    # TODO - use item features
+                    num_feats = len(self.item_features.columns)
+                    padded_seq = np.stack([self.item_features.iloc[s - 1] if s > 0 else np.zeros(num_feats) for s in padded_seq])
+                    inputs.append(padded_seq)
+                    labels.append(target_item)
+
+            X, y = np.array(inputs), np.array(labels)
+
+            X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.1, random_state=self.seed)
+            
+            train_dataset = SequentialDataset(X_train, y_train)
+            train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
+
+            val_dataset = SequentialDataset(X_val, y_val)
+            val_loader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False)
+
+            self.seq_train(train_loader, val_loader)
 
     def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
         """
@@ -149,30 +326,88 @@ class MyRecommender:
         #  2. Calculate relevance scores for each user-item pair
         #  3. Rank items by relevance and select top-k
         #  4. Return a dataframe with columns: user_idx, item_idx, relevance
-        cross = users.crossJoin(items).drop("__iter").toPandas().copy()
 
-        cross = pd.get_dummies(cross)
-        cross['orig_price'] = cross['price']
-        cross['price'] = self.scalar.transform(cross[['price']])
+        # for content-based recommender
+        # cross = users.crossJoin(items).drop("__iter").toPandas().copy()
 
-        cross['prob'] = self.model.predict_proba(cross.drop(['user_idx', 'item_idx', 'orig_price'], axis=1))[:, np.where(self.model.classes_ == 1)[0][0]]
-        # ranking strategy #1
-        cross['relevance'] = cross['prob']
-        # 13757.794205 11989.233503 2751.558841 2397.846701 0.102164 0.093003 0.623513 0.632488 0.208757 0.195399 1637.235156 1406.178382
+        # cross = pd.get_dummies(cross)
+        # cross['orig_price'] = cross['price']
+        # cross['price'] = self.scalar.transform(cross[['price']])
 
-        # ranking strategy #2
-        cross['expected_revenue'] = cross['prob'] * cross['price']
-        # 27824.587397 25614.228831 5564.917479 5122.845766 0.102164 0.093003 0.636853 0.627764 0.214730 0.192170 3289.998032 3038.555065
+        # cross['prob'] = self.model.predict_proba(cross.drop(['user_idx', 'item_idx', 'orig_price'], axis=1))[:, np.where(self.model.classes_ == 1)[0][0]]
+        # # ranking strategy #1
+        # cross['relevance'] = cross['prob']
+        # # 13757.794205 11989.233503 2751.558841 2397.846701 0.102164 0.093003 0.623513 0.632488 0.208757 0.195399 1637.235156 1406.178382
 
-        # ranking strategy #3
-        # TODO
+        # # ranking strategy #2
+        # cross['expected_revenue'] = cross['prob'] * cross['price']
+        # # 27824.587397 25614.228831 5564.917479 5122.845766 0.102164 0.093003 0.636853 0.627764 0.214730 0.192170 3289.998032 3038.555065
 
-        cross = cross.sort_values(by=["user_idx", "expected_revenue"], ascending=[True, False])
-        cross = cross.groupby("user_idx").head(k)
+        # cross = cross.sort_values(by=["user_idx", "expected_revenue"], ascending=[True, False])
+        # cross = cross.groupby("user_idx").head(k)
 
-        cross['price'] = cross['orig_price']
+        # cross['price'] = cross['orig_price']
 
-        return pandas_to_spark(cross)
+        # return pandas_to_spark(cross)
+
+        # for sequential-based recommender
+        self.model.eval()
+
+        users = users.toPandas()
+        items = items.toPandas()
+
+        if log is not None:
+            log = log.toPandas()
+            last_timestamp = 0
+            if self.user_history:
+                last_timestamp = max([entry['timestamp'] for history in self.user_history.values() for entry in history])
+            log['timestamp'] = log.index + last_timestamp + 1
+            
+            for uid, transactions in log.groupby('user_idx'):
+                self.user_history[uid].extend(transactions[['timestamp', 'item_idx', 'relevance']].to_dict('records'))
+                self.user_history[uid] = sorted(self.user_history[uid], key=lambda x: x['timestamp'])
+
+        recs = []
+        with torch.no_grad():
+            for uid in users['user_idx'].unique():
+                input_seq = [entry["item_idx"] for entry in self.user_history[uid]][-self.max_seq_len:]
+
+                # padded_input_seq = self.pad_sequences([input_seq])
+                # TODO - fix pad
+                padded_input_seq = self.pad_sequences([[s + 1 for s in input_seq]])[0]
+                # TODO - use item features
+                self.item_features = pd.get_dummies(self.item_features)
+                num_feats = len(self.item_features.columns)
+                padded_input_seq = np.stack([self.item_features.iloc[s - 1] if s > 0 else np.zeros(num_feats) for s in padded_input_seq])
+                input_seq = torch.tensor(padded_input_seq).unsqueeze(0).float().to(self.device)
+                
+                pred = self.model(input_seq).squeeze(0) # pred: (C, )
+                item_probs = torch.softmax(pred, dim=-1).cpu().numpy()
+
+                item_probs = pd.Series(item_probs, index=range(self.n_items))
+
+                if filter_seen_items:
+                    seen_items = {entry['item_idx'] for entry in self.user_history[uid]}
+                    item_probs = item_probs.drop(labels=list(seen_items), errors='ignore')
+                
+                valid_items_in_predict = items['item_idx'].unique()
+                item_probs = item_probs[item_probs.index.isin(valid_items_in_predict)]
+
+                curr_items = items[['item_idx', 'price']].set_index('item_idx')
+                pred_items = pd.DataFrame({ 'prob': item_probs, 'price': curr_items.loc[item_probs.index, 'price'] })
+                
+                pred_items['expected_revenue'] = pred_items['prob'] * pred_items['price']
+
+                top_k_items = pred_items.nlargest(k, 'expected_revenue')
+
+                for item_idx, row in top_k_items.iterrows():
+                    recs.append({
+                        'user_idx': uid,
+                        'item_idx': item_idx,
+                        'relevance': row['expected_revenue']
+                    })
+
+        return pandas_to_spark(pd.DataFrame(recs))
 
 # Cell: Data Exploration Functions
 """
